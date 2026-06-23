@@ -1,0 +1,9 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "cloth-try-on-dev"
+region = "ap-southeast-2"
+resolve_s3 = true
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+parameter_overrides = "Stage=dev AllowedOrigin=http://localhost:3000 MongoDbName=cloth_try_on"

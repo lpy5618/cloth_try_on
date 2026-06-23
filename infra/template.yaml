@@ -1,0 +1,223 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Cloud backend for Cloth Try-On Studio.
+
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+    AllowedPattern: '^[a-z0-9-]+$'
+  AllowedOrigin:
+    Type: String
+    Default: http://localhost:3000
+  MongoDbParameterName:
+    Type: String
+    Default: /cloth-try-on/dev/mongodb-uri
+    Description: SSM SecureString parameter name containing the MongoDB connection URI.
+  AiProviderParameterName:
+    Type: String
+    Default: /cloth-try-on/dev/ai-provider-json
+    Description: SSM SecureString parameter name containing JSON with GEMINI_API_KEY and/or OPENAI_API_KEY.
+  MongoDbName:
+    Type: String
+    Default: cloth_try_on
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Architectures:
+      - arm64
+    CodeUri: .
+    MemorySize: 1024
+    Timeout: 30
+    Environment:
+      Variables:
+        ASSETS_BUCKET: !Ref AssetsBucket
+        MONGODB_PARAMETER_NAME: !Ref MongoDbParameterName
+        AI_PROVIDER_PARAMETER_NAME: !Ref AiProviderParameterName
+        MONGODB_DATABASE: !Ref MongoDbName
+        ALLOWED_ORIGIN: !Ref AllowedOrigin
+
+Resources:
+  AssetsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - Content-Type
+            AllowedMethods:
+              - GET
+              - PUT
+              - HEAD
+            AllowedOrigins:
+              - !Ref AllowedOrigin
+            ExposedHeaders:
+              - ETag
+            MaxAge: 300
+      LifecycleConfiguration:
+        Rules:
+          - Id: AbortIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 3
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub cloth-try-on-${Stage}
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireUppercase: true
+          RequireSymbols: false
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub cloth-try-on-web-${Stage}
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+
+  Api:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub cloth-try-on-${Stage}
+      StageName: !Ref Stage
+      Cors:
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+        AllowHeaders: "'Authorization,Content-Type'"
+        AllowOrigin: !Sub "'${AllowedOrigin}'"
+        MaxAge: "'300'"
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        AddDefaultAuthorizerToCorsPreflight: false
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+            Identity:
+              Header: Authorization
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handlers/api.handler
+      Policies:
+        - S3WritePolicy:
+            BucketName: !Ref AssetsBucket
+        - S3ReadPolicy:
+            BucketName: !Ref AssetsBucket
+        - LambdaInvokePolicy:
+            FunctionName: !Ref GenerationWorkerFunction
+        - Statement:
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource:
+                - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${MongoDbParameterName}
+                - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${AiProviderParameterName}
+      Environment:
+        Variables:
+          GENERATION_WORKER_FUNCTION: !Ref GenerationWorkerFunction
+      Events:
+        CreateUploadUrl:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /v1/assets/presign
+            Method: post
+        CreateDownloadUrl:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /v1/assets/download
+            Method: get
+        Bootstrap:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /v1/state
+            Method: get
+        CollectionRoot:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /v1/{collection}
+            Method: any
+        CollectionById:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /v1/{collection}/{id}
+            Method: any
+        AnalyzeItem:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /v1/analyze-item
+            Method: post
+        RecommendOutfit:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /v1/recommend-outfit
+            Method: post
+        CreateGeneration:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /v1/generations
+            Method: post
+        GetGeneration:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /v1/generations/{id}
+            Method: get
+
+  GenerationWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handlers/generation-worker.handler
+      Timeout: 180
+      MemorySize: 2048
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref AssetsBucket
+        - S3WritePolicy:
+            BucketName: !Ref AssetsBucket
+        - Statement:
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource:
+                - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${MongoDbParameterName}
+                - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${AiProviderParameterName}
+
+Outputs:
+  ApiBaseUrl:
+    Description: API Gateway stage URL.
+    Value: !Sub https://${Api}.execute-api.${AWS::Region}.amazonaws.com/${Stage}
+  AssetsBucketName:
+    Value: !Ref AssetsBucket
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient

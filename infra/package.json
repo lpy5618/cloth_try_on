@@ -1,0 +1,16 @@
+{
+  "name": "cloth-try-on-cloud-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@aws-sdk/client-lambda": "^3.840.0",
+    "@aws-sdk/client-s3": "^3.840.0",
+    "@aws-sdk/client-ssm": "^3.840.0",
+    "@aws-sdk/s3-request-presigner": "^3.840.0",
+    "mongodb": "^6.18.0"
+  }
+}

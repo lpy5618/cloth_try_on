@@ -54,6 +54,16 @@ const DEFAULT_SETTINGS = {
   mongoDb: ""
 };
 
+const CLOUD_CONFIG_STORAGE_KEY = "cloth_try_on_cloud_config_v1";
+const CLOUD_SESSION_STORAGE_KEY = "cloth_try_on_cloud_session_v1";
+const CLOUD_PRIMARY_STORAGE_KEY = "cloth_try_on_cloud_primary_v1";
+const DEFAULT_CLOUD_CONFIG = {
+  apiBaseUrl: process.env.NEXT_PUBLIC_CLOUD_API_BASE_URL || "",
+  region: process.env.NEXT_PUBLIC_AWS_REGION || "ap-southeast-2",
+  userPoolId: process.env.NEXT_PUBLIC_COGNITO_USER_POOL_ID || "",
+  clientId: process.env.NEXT_PUBLIC_COGNITO_CLIENT_ID || ""
+};
+
 export default function Home() {
   const dbRef = useRef(null);
   const backupFileRef = useRef(null);
@@ -89,6 +99,21 @@ export default function Home() {
   const [compareIds, setCompareIds] = useState([]);
   const [compareOpen, setCompareOpen] = useState(false);
   const [bgRemovingId, setBgRemovingId] = useState("");
+  const [cloudConfig, setCloudConfig] = useState(DEFAULT_CLOUD_CONFIG);
+  const [cloudSession, setCloudSession] = useState(null);
+  const [cloudEmail, setCloudEmail] = useState("");
+  const [cloudPassword, setCloudPassword] = useState("");
+  const [cloudConfirmationCode, setCloudConfirmationCode] = useState("");
+  const [cloudConfirmationPending, setCloudConfirmationPending] = useState(false);
+  const [cloudBusy, setCloudBusy] = useState("");
+  const [cloudMessage, setCloudMessage] = useState(null);
+  const [cloudState, setCloudState] = useState(null);
+  const [cloudAssets, setCloudAssets] = useState({ model: null, item: null });
+  const [cloudTestItem, setCloudTestItem] = useState(null);
+  const [cloudAnalysis, setCloudAnalysis] = useState(null);
+  const [cloudJob, setCloudJob] = useState(null);
+  const [cloudPrimary, setCloudPrimary] = useState(false);
+  const [cloudSyncProgress, setCloudSyncProgress] = useState(null);
 
   useEffect(() => {
     let active = true;
@@ -141,6 +166,19 @@ export default function Home() {
     };
   }, []);
 
+  useEffect(() => {
+    const savedConfig = safeJsonParse(localStorage.getItem(CLOUD_CONFIG_STORAGE_KEY));
+    const savedSession = safeJsonParse(sessionStorage.getItem(CLOUD_SESSION_STORAGE_KEY));
+    if (savedConfig) setCloudConfig(normalizeCloudConfig(savedConfig));
+    setCloudPrimary(localStorage.getItem(CLOUD_PRIMARY_STORAGE_KEY) === "true");
+    if (isCloudSessionValid(savedSession)) {
+      setCloudSession(savedSession);
+      setCloudEmail(savedSession.email || "");
+    } else {
+      sessionStorage.removeItem(CLOUD_SESSION_STORAGE_KEY);
+    }
+  }, []);
+
   const filteredItems = useMemo(() => {
     const needle = query.trim().toLowerCase();
     return items.filter((item) => {
@@ -178,9 +216,386 @@ export default function Home() {
     () => compareIds.map((id) => history.find((entry) => entry.id === id)).filter(Boolean),
     [compareIds, history]
   );
+  const cloudConfigured = isCloudConfigComplete(cloudConfig);
+  const cloudSignedIn = isCloudSessionValid(cloudSession);
+  const cloudActive = cloudSignedIn && cloudPrimary;
 
   function itemImageUrl(item) {
     return assetUrlForItem(item, assetUrls);
+  }
+
+  function saveCloudConfig() {
+    const nextConfig = normalizeCloudConfig(cloudConfig);
+    setCloudConfig(nextConfig);
+    localStorage.setItem(CLOUD_CONFIG_STORAGE_KEY, JSON.stringify(nextConfig));
+    setCloudMessage({ tone: "success", text: "云端配置已保存" });
+  }
+
+  function signOutCloud() {
+    sessionStorage.removeItem(CLOUD_SESSION_STORAGE_KEY);
+    setCloudSession(null);
+    setCloudState(null);
+    setCloudAssets({ model: null, item: null });
+    setCloudTestItem(null);
+    setCloudAnalysis(null);
+    setCloudJob(null);
+    setCloudPrimary(false);
+    localStorage.removeItem(CLOUD_PRIMARY_STORAGE_KEY);
+    setCloudMessage({ tone: "neutral", text: "已退出云端会话" });
+  }
+
+  async function signInCloud() {
+    try {
+      setCloudBusy("signin");
+      const config = requireCloudConfig(cloudConfig);
+      const email = cloudEmail.trim().toLowerCase();
+      if (!email || !cloudPassword) throw new Error("请输入邮箱和密码。");
+      const response = await cognitoRequest(config, "InitiateAuth", {
+        AuthFlow: "USER_PASSWORD_AUTH",
+        ClientId: config.clientId,
+        AuthParameters: { USERNAME: email, PASSWORD: cloudPassword }
+      });
+      const session = createCloudSession(response.AuthenticationResult, email);
+      sessionStorage.setItem(CLOUD_SESSION_STORAGE_KEY, JSON.stringify(session));
+      setCloudSession(session);
+      setCloudPassword("");
+      setCloudConfirmationPending(false);
+      setCloudMessage({ tone: "success", text: "已登录云端" });
+    } catch (error) {
+      setCloudMessage({ tone: "danger", text: error.message || "云端登录失败" });
+    } finally {
+      setCloudBusy("");
+    }
+  }
+
+  async function signUpCloud() {
+    try {
+      setCloudBusy("signup");
+      const config = requireCloudConfig(cloudConfig);
+      const email = cloudEmail.trim().toLowerCase();
+      if (!email || !cloudPassword) throw new Error("请输入邮箱和密码。");
+      await cognitoRequest(config, "SignUp", {
+        ClientId: config.clientId,
+        Username: email,
+        Password: cloudPassword,
+        UserAttributes: [{ Name: "email", Value: email }]
+      });
+      setCloudConfirmationPending(true);
+      setCloudMessage({ tone: "success", text: "验证码已发送到邮箱" });
+    } catch (error) {
+      setCloudMessage({ tone: "danger", text: error.message || "注册失败" });
+    } finally {
+      setCloudBusy("");
+    }
+  }
+
+  async function confirmCloudSignUp() {
+    try {
+      setCloudBusy("confirm");
+      const config = requireCloudConfig(cloudConfig);
+      const email = cloudEmail.trim().toLowerCase();
+      if (!email || !cloudConfirmationCode.trim()) throw new Error("请输入邮箱和验证码。");
+      await cognitoRequest(config, "ConfirmSignUp", {
+        ClientId: config.clientId,
+        Username: email,
+        ConfirmationCode: cloudConfirmationCode.trim()
+      });
+      setCloudConfirmationPending(false);
+      setCloudConfirmationCode("");
+      setCloudMessage({ tone: "success", text: "账号已验证，请登录" });
+    } catch (error) {
+      setCloudMessage({ tone: "danger", text: error.message || "验证失败" });
+    } finally {
+      setCloudBusy("");
+    }
+  }
+
+  async function refreshCloudState() {
+    try {
+      setCloudBusy("state");
+      const state = await cloudRequest(cloudConfig, cloudSession, "/v1/state");
+      setCloudState(state);
+      setCloudMessage({ tone: "success", text: "云端状态已更新" });
+    } catch (error) {
+      setCloudMessage({ tone: "danger", text: error.message || "读取云端状态失败" });
+    } finally {
+      setCloudBusy("");
+    }
+  }
+
+  async function activateCloudPrimary() {
+    if (!dbRef.current) return;
+    try {
+      requireCloudConfig(cloudConfig);
+      requireCloudSession(cloudSession);
+      setCloudBusy("sync");
+      setCloudSyncProgress({ done: 0, total: items.length, label: "同步衣橱" });
+      const syncedItems = [];
+      for (let index = 0; index < items.length; index += 1) {
+        const syncedItem = await syncItemToCloud(items[index]);
+        syncedItems.push(syncedItem);
+        setCloudSyncProgress({ done: index + 1, total: items.length, label: syncedItem.name });
+      }
+      await ensureCloudModelAsset();
+      await syncPromptTemplatesToCloud();
+      await syncOutfitsToCloud();
+      const state = await cloudRequest(cloudConfig, cloudSession, "/v1/state");
+      await hydrateCloudState(state, syncedItems);
+      setCloudState(state);
+      setCloudPrimary(true);
+      localStorage.setItem(CLOUD_PRIMARY_STORAGE_KEY, "true");
+      setCloudMessage({ tone: "success", text: "已切换为云端主存储" });
+    } catch (error) {
+      setCloudMessage({ tone: "danger", text: error.message || "同步到云端失败" });
+    } finally {
+      setCloudBusy("");
+      setCloudSyncProgress(null);
+    }
+  }
+
+  function deactivateCloudPrimary() {
+    setCloudPrimary(false);
+    localStorage.removeItem(CLOUD_PRIMARY_STORAGE_KEY);
+    setCloudMessage({ tone: "neutral", text: "已切回本地优先模式" });
+  }
+
+  async function uploadBlobToCloud(blob, kind) {
+    const config = requireCloudConfig(cloudConfig);
+    const session = requireCloudSession(cloudSession);
+    const contentType = blob.type || "image/jpeg";
+    const presign = await cloudRequest(config, session, "/v1/assets/presign", {
+      method: "POST",
+      body: { contentType, kind }
+    });
+    const upload = await fetch(presign.uploadUrl, { method: "PUT", headers: presign.headers, body: blob });
+    if (!upload.ok) throw new Error(`S3 上传失败 (${upload.status})`);
+    const download = await cloudRequest(config, session, `/v1/assets/download?key=${encodeURIComponent(presign.assetKey)}`);
+    return { assetKey: presign.assetKey, previewUrl: download.downloadUrl };
+  }
+
+  async function localAssetBlob(assetId) {
+    const asset = assetId ? await getOne(dbRef.current, "assets", assetId) : null;
+    if (asset?.blob) return asset.blob;
+    const url = assetUrls[assetId];
+    if (!url) throw new Error("本地图片缓存不存在，无法上传到云端。");
+    const response = await fetch(url);
+    if (!response.ok) throw new Error("无法读取本地图片缓存。");
+    return response.blob();
+  }
+
+  async function syncItemToCloud(item) {
+    let nextItem = { ...item };
+    if (!nextItem.cloudAssetKey) {
+      const uploaded = await uploadBlobToCloud(await localAssetBlob(nextItem.imageAssetId), "wardrobe");
+      nextItem.cloudAssetKey = uploaded.assetKey;
+      setAssetUrls((current) => ({ ...current, [nextItem.imageAssetId]: uploaded.previewUrl }));
+    }
+    if (nextItem.cutoutAssetId && !nextItem.cloudCutoutAssetKey) {
+      const uploaded = await uploadBlobToCloud(await localAssetBlob(nextItem.cutoutAssetId), "cutout");
+      nextItem.cloudCutoutAssetKey = uploaded.assetKey;
+      setAssetUrls((current) => ({ ...current, [nextItem.cutoutAssetId]: uploaded.previewUrl }));
+    }
+
+    const body = cloudItemPayload(nextItem);
+    const remote = nextItem.cloudId
+      ? await cloudRequest(cloudConfig, cloudSession, `/v1/items/${encodeURIComponent(nextItem.cloudId)}`, { method: "PUT", body })
+      : await cloudRequest(cloudConfig, cloudSession, "/v1/items", { method: "POST", body });
+    nextItem = {
+      ...nextItem,
+      cloudId: remote.id,
+      cloudAssetKey: remote.imageAssetKey || nextItem.cloudAssetKey,
+      cloudCutoutAssetKey: remote.cutoutAssetKey || ""
+    };
+    await put(dbRef.current, "items", nextItem);
+    setItems((current) => current.map((entry) => (entry.id === nextItem.id ? nextItem : entry)));
+    return nextItem;
+  }
+
+  async function ensureCloudModelAsset() {
+    if (!modelAssetId) return "";
+    const existingKey = await getMeta(dbRef.current, "cloudModelAssetKey");
+    if (existingKey) return existingKey;
+    const uploaded = await uploadBlobToCloud(await localAssetBlob(modelAssetId), "model");
+    await setMeta(dbRef.current, "cloudModelAssetKey", uploaded.assetKey);
+    setAssetUrls((current) => ({ ...current, [modelAssetId]: uploaded.previewUrl }));
+    return uploaded.assetKey;
+  }
+
+  async function syncPromptTemplatesToCloud() {
+    const synced = [];
+    for (const template of promptTemplates) {
+      const body = { name: template.name, prompt: template.prompt, localId: template.id };
+      const remote = template.cloudId
+        ? await cloudRequest(cloudConfig, cloudSession, `/v1/prompt-templates/${encodeURIComponent(template.cloudId)}`, { method: "PUT", body })
+        : await cloudRequest(cloudConfig, cloudSession, "/v1/prompt-templates", { method: "POST", body });
+      synced.push({ ...template, cloudId: remote.id });
+    }
+    await setMeta(dbRef.current, "promptTemplates", synced);
+    setPromptTemplates(synced);
+  }
+
+  async function syncOutfitsToCloud() {
+    const synced = [];
+    for (const outfit of savedOutfits) {
+      const body = { name: outfit.name, itemIds: outfit.itemIds, itemNames: outfit.itemNames, localId: outfit.id };
+      const remote = outfit.cloudId
+        ? await cloudRequest(cloudConfig, cloudSession, `/v1/outfits/${encodeURIComponent(outfit.cloudId)}`, { method: "PUT", body })
+        : await cloudRequest(cloudConfig, cloudSession, "/v1/outfits", { method: "POST", body });
+      synced.push({ ...outfit, cloudId: remote.id });
+    }
+    await setMeta(dbRef.current, "savedOutfits", synced);
+    setSavedOutfits(synced);
+  }
+
+  async function hydrateCloudState(state, knownItems = items) {
+    const existingByCloudId = new Map(knownItems.filter((item) => item.cloudId).map((item) => [item.cloudId, item]));
+    const nextUrls = {};
+    const hydratedItems = [];
+    for (const remote of state.items || []) {
+      const existing = existingByCloudId.get(remote.id);
+      const imageAssetId = existing?.imageAssetId || `cloud:${remote.imageAssetKey}`;
+      const cutoutAssetId = remote.cutoutAssetKey ? existing?.cutoutAssetId || `cloud:${remote.cutoutAssetKey}` : "";
+      const localItem = {
+        ...(existing || {}),
+        ...remote,
+        id: remote.localId || existing?.id || remote.id,
+        cloudId: remote.id,
+        cloudAssetKey: remote.imageAssetKey,
+        cloudCutoutAssetKey: remote.cutoutAssetKey || "",
+        imageAssetId,
+        ...(cutoutAssetId ? { cutoutAssetId } : {})
+      };
+      if (!remote.cutoutAssetKey) delete localItem.cutoutAssetId;
+      const imageDownload = await cloudRequest(cloudConfig, cloudSession, `/v1/assets/download?key=${encodeURIComponent(remote.imageAssetKey)}`);
+      nextUrls[imageAssetId] = imageDownload.downloadUrl;
+      if (remote.cutoutAssetKey) {
+        const cutoutDownload = await cloudRequest(cloudConfig, cloudSession, `/v1/assets/download?key=${encodeURIComponent(remote.cutoutAssetKey)}`);
+        nextUrls[cutoutAssetId] = cutoutDownload.downloadUrl;
+      }
+      hydratedItems.push(localItem);
+      await put(dbRef.current, "items", localItem);
+    }
+    if (hydratedItems.length) {
+      setItems(sortByDate(hydratedItems));
+      setAssetUrls((current) => ({ ...current, ...nextUrls }));
+    }
+  }
+
+  async function uploadCloudAsset(slot, event) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    try {
+      setCloudBusy(`upload-${slot}`);
+      const blob = await compressImage(file, 1800);
+      const config = requireCloudConfig(cloudConfig);
+      const session = requireCloudSession(cloudSession);
+      const presign = await cloudRequest(config, session, "/v1/assets/presign", {
+        method: "POST",
+        body: { contentType: blob.type || "image/jpeg", kind: slot === "model" ? "model" : "wardrobe" }
+      });
+      const upload = await fetch(presign.uploadUrl, {
+        method: "PUT",
+        headers: presign.headers,
+        body: blob
+      });
+      if (!upload.ok) throw new Error(`S3 上传失败 (${upload.status})`);
+      const download = await cloudRequest(config, session, `/v1/assets/download?key=${encodeURIComponent(presign.assetKey)}`);
+      setCloudAssets((current) => ({
+        ...current,
+        [slot]: { assetKey: presign.assetKey, previewUrl: download.downloadUrl, name: cleanName(file.name) }
+      }));
+      setCloudMessage({ tone: "success", text: `${slot === "model" ? "人物参考图" : "单品图"}已上传到 S3` });
+    } catch (error) {
+      setCloudMessage({ tone: "danger", text: error.message || "上传失败" });
+    } finally {
+      setCloudBusy("");
+    }
+  }
+
+  async function createCloudTestItem() {
+    try {
+      setCloudBusy("item");
+      if (!cloudAssets.item) throw new Error("请先上传单品图。");
+      const item = await cloudRequest(cloudConfig, cloudSession, "/v1/items", {
+        method: "POST",
+        body: {
+          name: cloudAssets.item.name || "Cloud test item",
+          category: "top",
+          tags: ["cloud-check"],
+          imageAssetKey: cloudAssets.item.assetKey
+        }
+      });
+      setCloudTestItem(item);
+      await refreshCloudState();
+      setCloudMessage({ tone: "success", text: "测试单品已写入 MongoDB" });
+    } catch (error) {
+      setCloudMessage({ tone: "danger", text: error.message || "写入测试单品失败" });
+    } finally {
+      setCloudBusy("");
+    }
+  }
+
+  async function deleteCloudTestItem() {
+    if (!cloudTestItem?.id) return;
+    try {
+      setCloudBusy("delete-item");
+      await cloudRequest(cloudConfig, cloudSession, `/v1/items/${encodeURIComponent(cloudTestItem.id)}`, { method: "DELETE" });
+      setCloudTestItem(null);
+      await refreshCloudState();
+      setCloudMessage({ tone: "success", text: "测试单品已删除" });
+    } catch (error) {
+      setCloudMessage({ tone: "danger", text: error.message || "删除测试单品失败" });
+    } finally {
+      setCloudBusy("");
+    }
+  }
+
+  async function analyzeCloudItem() {
+    try {
+      setCloudBusy("analyze");
+      if (!cloudAssets.item) throw new Error("请先上传单品图。");
+      const analysis = await cloudRequest(cloudConfig, cloudSession, "/v1/analyze-item", {
+        method: "POST",
+        body: { provider: settings.provider, assetKey: cloudAssets.item.assetKey }
+      });
+      setCloudAnalysis(analysis);
+      setCloudMessage({ tone: "success", text: "单品识别已完成" });
+    } catch (error) {
+      setCloudMessage({ tone: "danger", text: error.message || "单品识别失败" });
+    } finally {
+      setCloudBusy("");
+    }
+  }
+
+  async function generateCloudTest() {
+    try {
+      setCloudBusy("generate");
+      if (!cloudAssets.model || !cloudAssets.item) throw new Error("请先上传人物参考图和单品图。");
+      const item = cloudTestItem || {
+        id: crypto.randomUUID(),
+        name: cloudAssets.item.name || "Cloud test item",
+        category: cloudAnalysis?.category || "top"
+      };
+      const job = await cloudRequest(cloudConfig, cloudSession, "/v1/generations", {
+        method: "POST",
+        body: {
+          provider: settings.provider,
+          prompt: renderedPrompt,
+          occasion,
+          modelAssetKey: cloudAssets.model.assetKey,
+          items: [{ ...item, assetKey: cloudAssets.item.assetKey }]
+        }
+      });
+      setCloudJob(job);
+      const completed = await pollCloudGeneration(cloudConfig, cloudSession, job.jobId, setCloudJob);
+      setCloudJob(completed);
+      setCloudMessage({ tone: completed.status === "completed" ? "success" : "danger", text: completed.status === "completed" ? "云端生成已完成" : completed.error || "云端生成失败" });
+    } catch (error) {
+      setCloudMessage({ tone: "danger", text: error.message || "创建生成任务失败" });
+    } finally {
+      setCloudBusy("");
+    }
   }
 
   async function handleItemUpload(event) {
@@ -189,39 +604,59 @@ export default function Home() {
 
     const nextItems = [];
     const nextUrls = {};
-    for (const file of files) {
-      const blob = await compressImage(file);
-      const assetId = crypto.randomUUID();
-      const item = {
-        id: crypto.randomUUID(),
-        name: cleanName(file.name),
-        category: guessCategory(file.name),
-        tags: [],
-        imageAssetId: assetId,
-        createdAt: new Date().toISOString()
-      };
-      await put(dbRef.current, "assets", { id: assetId, blob, type: blob.type });
-      await put(dbRef.current, "items", item);
-      nextItems.push(item);
-      nextUrls[assetId] = URL.createObjectURL(blob);
+    try {
+      if (cloudActive) setCloudBusy("closet-upload");
+      for (const file of files) {
+        const blob = await compressImage(file);
+        const assetId = crypto.randomUUID();
+        let item = {
+          id: crypto.randomUUID(),
+          name: cleanName(file.name),
+          category: guessCategory(file.name),
+          tags: [],
+          imageAssetId: assetId,
+          createdAt: new Date().toISOString()
+        };
+        await put(dbRef.current, "assets", { id: assetId, blob, type: blob.type });
+        await put(dbRef.current, "items", item);
+        if (cloudActive) item = await syncItemToCloud(item);
+        nextItems.push(item);
+        nextUrls[assetId] = URL.createObjectURL(blob);
+      }
+      setItems((current) => sortByDate([...nextItems, ...current]));
+      setAssetUrls((current) => ({ ...current, ...nextUrls }));
+    } catch (error) {
+      console.error(error);
+      alert(`上传失败：${error.message}`);
+    } finally {
+      if (cloudActive) setCloudBusy("");
+      event.target.value = "";
     }
-
-    setItems((current) => sortByDate([...nextItems, ...current]));
-    setAssetUrls((current) => ({ ...current, ...nextUrls }));
-    event.target.value = "";
   }
 
   async function handleModelUpload(event) {
     const file = event.target.files?.[0];
     if (!file || !dbRef.current) return;
 
-    const blob = await compressImage(file, 1800);
-    const assetId = crypto.randomUUID();
-    await put(dbRef.current, "assets", { id: assetId, blob, type: blob.type });
-    await setMeta(dbRef.current, "modelAssetId", assetId);
-    setModelAssetId(assetId);
-    setAssetUrls((current) => ({ ...current, [assetId]: URL.createObjectURL(blob) }));
-    event.target.value = "";
+    try {
+      const blob = await compressImage(file, 1800);
+      const assetId = crypto.randomUUID();
+      await put(dbRef.current, "assets", { id: assetId, blob, type: blob.type });
+      await setMeta(dbRef.current, "modelAssetId", assetId);
+      await setMeta(dbRef.current, "cloudModelAssetKey", "");
+      setModelAssetId(assetId);
+      setAssetUrls((current) => ({ ...current, [assetId]: URL.createObjectURL(blob) }));
+      if (cloudActive) {
+        setCloudBusy("model-upload");
+        await ensureCloudModelAsset();
+      }
+    } catch (error) {
+      console.error(error);
+      alert(`上传失败：${error.message}`);
+    } finally {
+      if (cloudActive) setCloudBusy("");
+      event.target.value = "";
+    }
   }
 
   async function toggleSelection(itemId) {
@@ -286,10 +721,16 @@ export default function Home() {
   }
 
   async function recommendOutfit() {
-    const availableItems = items
+    let sourceItems = items;
+    if (cloudActive) {
+      const syncedItems = [];
+      for (const item of items) syncedItems.push(await syncItemToCloud(item));
+      sourceItems = syncedItems;
+    }
+    const availableItems = sourceItems
       .filter((item) => getItemQuality(item) !== "blocked")
       .map((item) => ({
-        id: item.id,
+        id: cloudActive ? item.cloudId : item.id,
         name: item.name,
         category: item.category,
         tags: item.tags,
@@ -303,20 +744,35 @@ export default function Home() {
 
     setRecommending(true);
     try {
-      const response = await fetch("/api/recommend-outfit", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          provider: settings.provider,
-          occasion,
-          weather: weatherInfo,
-          items: availableItems
-        })
-      });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || `推荐失败：${response.status}`);
+      let data;
+      if (cloudActive) {
+        data = await cloudRequest(cloudConfig, cloudSession, "/v1/recommend-outfit", {
+          method: "POST",
+          body: {
+            provider: settings.provider,
+            occasion,
+            weather: weatherInfo,
+            items: availableItems
+          }
+        });
+      } else {
+        const response = await fetch("/api/recommend-outfit", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            provider: settings.provider,
+            occasion,
+            weather: weatherInfo,
+            items: availableItems
+          })
+        });
+        data = await response.json();
+        if (!response.ok) throw new Error(data.error || `推荐失败：${response.status}`);
+      }
 
-      const validIds = data.itemIds.filter((id) => items.some((item) => item.id === id));
+      const validIds = data.itemIds
+        .map((id) => cloudActive ? sourceItems.find((item) => item.cloudId === id)?.id : id)
+        .filter((id) => items.some((item) => item.id === id));
       if (!validIds.length) throw new Error("推荐结果里没有可用单品。");
 
       setSelection(validIds);
@@ -350,13 +806,14 @@ export default function Home() {
       ? selection.filter((id) => id !== nextItem.id)
       : selection;
     await put(dbRef.current, "items", nextItem);
+    const syncedItem = cloudActive ? await syncItemToCloud(nextItem) : nextItem;
     if (nextSelection.length !== selection.length) {
       await setMeta(dbRef.current, "selection", nextSelection);
       setSelection(nextSelection);
       setSelectedSavedOutfitId("");
       setRecommendation(null);
     }
-    setItems((current) => current.map((item) => (item.id === nextItem.id ? nextItem : item)));
+    setItems((current) => current.map((item) => (item.id === syncedItem.id ? syncedItem : item)));
     setEditing(null);
   }
 
@@ -375,26 +832,36 @@ export default function Home() {
   }
 
   async function analyzeSingleItem(item) {
-    const blob = await fetch(assetUrls[item.imageAssetId]).then((response) => response.blob());
-    const image = await blobToDataUrl(blob);
-    const response = await fetch("/api/analyze-item", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ provider: settings.provider, image })
-    });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || `识别失败：${response.status}`);
+    const sourceItem = cloudActive ? await syncItemToCloud(item) : item;
+    let data;
+    if (cloudActive) {
+      data = await cloudRequest(cloudConfig, cloudSession, "/v1/analyze-item", {
+        method: "POST",
+        body: { provider: settings.provider, assetKey: sourceItem.cloudAssetKey }
+      });
+    } else {
+      const blob = await fetch(assetUrls[sourceItem.imageAssetId]).then((response) => response.blob());
+      const image = await blobToDataUrl(blob);
+      const response = await fetch("/api/analyze-item", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider: settings.provider, image })
+      });
+      data = await response.json();
+      if (!response.ok) throw new Error(data.error || `识别失败：${response.status}`);
+    }
 
     const nextItem = {
-      ...item,
-      name: data.name || item.name,
-      category: data.category || item.category,
-      tags: Array.isArray(data.tags) ? data.tags : item.tags
+      ...sourceItem,
+      name: data.name || sourceItem.name,
+      category: data.category || sourceItem.category,
+      tags: Array.isArray(data.tags) ? data.tags : sourceItem.tags
     };
     await put(dbRef.current, "items", nextItem);
-    setItems((current) => current.map((entry) => (entry.id === item.id ? nextItem : entry)));
-    setEditing((current) => (current?.id === item.id ? { ...nextItem, tagText: nextItem.tags.join(", ") } : current));
-    return nextItem;
+    const syncedItem = cloudActive ? await syncItemToCloud(nextItem) : nextItem;
+    setItems((current) => current.map((entry) => (entry.id === syncedItem.id ? syncedItem : entry)));
+    setEditing((current) => (current?.id === syncedItem.id ? { ...syncedItem, tagText: syncedItem.tags.join(", ") } : current));
+    return syncedItem;
   }
 
   async function analyzeFilteredItems() {
@@ -427,6 +894,10 @@ export default function Home() {
   async function deleteItem(item) {
     if (!confirm(`确定从衣橱删除“${item.name}”吗？`)) return;
 
+    if (cloudActive && item.cloudId) {
+      await cloudRequest(cloudConfig, cloudSession, `/v1/items/${encodeURIComponent(item.cloudId)}`, { method: "DELETE" });
+    }
+
     await remove(dbRef.current, "items", item.id);
     await remove(dbRef.current, "assets", item.imageAssetId);
     if (item.cutoutAssetId) await remove(dbRef.current, "assets", item.cutoutAssetId);
@@ -457,6 +928,7 @@ export default function Home() {
       const cutoutBlob = await removeBackground(sourceBlob);
       const assetId = crypto.randomUUID();
       const nextItem = { ...item, cutoutAssetId: assetId };
+      delete nextItem.cloudCutoutAssetKey;
 
       await put(dbRef.current, "assets", {
         id: assetId,
@@ -464,10 +936,11 @@ export default function Home() {
         type: cutoutBlob.type || "image/png"
       });
       await put(dbRef.current, "items", nextItem);
+      const syncedItem = cloudActive ? await syncItemToCloud(nextItem) : nextItem;
       if (item.cutoutAssetId) await remove(dbRef.current, "assets", item.cutoutAssetId);
 
-      setItems((current) => current.map((entry) => (entry.id === item.id ? nextItem : entry)));
-      setEditing((current) => (current?.id === item.id ? { ...nextItem, tagText: nextItem.tags.join(", ") } : current));
+      setItems((current) => current.map((entry) => (entry.id === item.id ? syncedItem : entry)));
+      setEditing((current) => (current?.id === item.id ? { ...syncedItem, tagText: syncedItem.tags.join(", ") } : current));
       setAssetUrls((current) => {
         const next = { ...current };
         if (item.cutoutAssetId && next[item.cutoutAssetId]) {
@@ -493,6 +966,8 @@ export default function Home() {
       const rotatedBlob = await rotateImageBlob(sourceBlob, direction);
       const nextItem = { ...item };
       delete nextItem.cutoutAssetId;
+      delete nextItem.cloudAssetKey;
+      delete nextItem.cloudCutoutAssetKey;
 
       await put(dbRef.current, "assets", {
         id: item.imageAssetId,
@@ -501,9 +976,10 @@ export default function Home() {
       });
       if (item.cutoutAssetId) await remove(dbRef.current, "assets", item.cutoutAssetId);
       await put(dbRef.current, "items", nextItem);
+      const syncedItem = cloudActive ? await syncItemToCloud(nextItem) : nextItem;
 
-      setItems((current) => current.map((entry) => (entry.id === item.id ? nextItem : entry)));
-      setEditing((current) => (current?.id === item.id ? { ...nextItem, tagText: nextItem.tags.join(", ") } : current));
+      setItems((current) => current.map((entry) => (entry.id === item.id ? syncedItem : entry)));
+      setEditing((current) => (current?.id === item.id ? { ...syncedItem, tagText: syncedItem.tags.join(", ") } : current));
       setAssetUrls((current) => {
         const next = { ...current };
         if (next[item.imageAssetId]) URL.revokeObjectURL(next[item.imageAssetId]);
@@ -526,11 +1002,13 @@ export default function Home() {
 
     const nextItem = { ...item };
     delete nextItem.cutoutAssetId;
+    delete nextItem.cloudCutoutAssetKey;
     await remove(dbRef.current, "assets", item.cutoutAssetId);
     await put(dbRef.current, "items", nextItem);
+    const syncedItem = cloudActive ? await syncItemToCloud(nextItem) : nextItem;
 
-    setItems((current) => current.map((entry) => (entry.id === item.id ? nextItem : entry)));
-    setEditing((current) => (current?.id === item.id ? { ...nextItem, tagText: nextItem.tags.join(", ") } : current));
+    setItems((current) => current.map((entry) => (entry.id === item.id ? syncedItem : entry)));
+    setEditing((current) => (current?.id === item.id ? { ...syncedItem, tagText: syncedItem.tags.join(", ") } : current));
     setAssetUrls((current) => {
       const next = { ...current };
       if (next[item.cutoutAssetId]) URL.revokeObjectURL(next[item.cutoutAssetId]);
@@ -547,12 +1025,19 @@ export default function Home() {
   async function savePromptTemplate() {
     const name = window.prompt("给当前 prompt 起个名字：");
     if (!name?.trim()) return;
-    const nextTemplate = {
+    let nextTemplate = {
       id: crypto.randomUUID(),
       name: name.trim(),
       prompt,
       createdAt: new Date().toISOString()
     };
+    if (cloudActive) {
+      const remote = await cloudRequest(cloudConfig, cloudSession, "/v1/prompt-templates", {
+        method: "POST",
+        body: { name: nextTemplate.name, prompt: nextTemplate.prompt, localId: nextTemplate.id }
+      });
+      nextTemplate = { ...nextTemplate, cloudId: remote.id };
+    }
     const nextTemplates = [nextTemplate, ...promptTemplates];
     setPromptTemplates(nextTemplates);
     setSelectedPromptTemplateId(nextTemplate.id);
@@ -563,6 +1048,9 @@ export default function Home() {
     if (!selectedPromptTemplateId) return;
     const template = promptTemplates.find((entry) => entry.id === selectedPromptTemplateId);
     if (!template || !confirm(`删除 prompt 模板“${template.name}”？`)) return;
+    if (cloudActive && template.cloudId) {
+      await cloudRequest(cloudConfig, cloudSession, `/v1/prompt-templates/${encodeURIComponent(template.cloudId)}`, { method: "DELETE" });
+    }
     const nextTemplates = promptTemplates.filter((entry) => entry.id !== selectedPromptTemplateId);
     setPromptTemplates(nextTemplates);
     setSelectedPromptTemplateId("");
@@ -636,13 +1124,20 @@ export default function Home() {
     const name = window.prompt("给这套搭配起个名字：", fallbackName.slice(0, 80));
     if (!name?.trim()) return;
 
-    const nextOutfit = {
+    let nextOutfit = {
       id: crypto.randomUUID(),
       name: name.trim(),
       itemIds: selectedItems.map((item) => item.id),
       itemNames: selectedItems.map((item) => item.name),
       createdAt: new Date().toISOString()
     };
+    if (cloudActive) {
+      const remote = await cloudRequest(cloudConfig, cloudSession, "/v1/outfits", {
+        method: "POST",
+        body: { ...nextOutfit, localId: nextOutfit.id }
+      });
+      nextOutfit = { ...nextOutfit, cloudId: remote.id };
+    }
     const nextOutfits = [nextOutfit, ...savedOutfits];
     setSavedOutfits(nextOutfits);
     setSelectedSavedOutfitId(nextOutfit.id);
@@ -669,6 +1164,9 @@ export default function Home() {
     if (!selectedSavedOutfitId) return;
     const outfit = savedOutfits.find((entry) => entry.id === selectedSavedOutfitId);
     if (!outfit || !confirm(`删除搭配“${outfit.name}”？`)) return;
+    if (cloudActive && outfit.cloudId) {
+      await cloudRequest(cloudConfig, cloudSession, `/v1/outfits/${encodeURIComponent(outfit.cloudId)}`, { method: "DELETE" });
+    }
 
     const nextOutfits = savedOutfits.filter((entry) => entry.id !== selectedSavedOutfitId);
     setSavedOutfits(nextOutfits);
@@ -693,9 +1191,41 @@ export default function Home() {
     setBusy(true);
     try {
       const requestDebug = buildRequestDebug(settings, occasion, prompt, renderedPrompt, modelAssetId, selectedItems, weatherInfo);
-      const result = settings.endpoint
-        ? await callBackend(dbRef.current, settings, occasion, renderedPrompt, modelAssetId, selectedItems)
-        : await createLocalMockup(assetUrls[modelAssetId], selectedItems, assetUrls, occasion, settings);
+      let result;
+      if (cloudActive) {
+        const modelAssetKey = await ensureCloudModelAsset();
+        const syncedItems = [];
+        for (const item of selectedItems) syncedItems.push(await syncItemToCloud(item));
+        const job = await cloudRequest(cloudConfig, cloudSession, "/v1/generations", {
+          method: "POST",
+          body: {
+            provider: settings.provider,
+            occasion,
+            prompt: renderedPrompt,
+            modelAssetKey,
+            items: syncedItems.map((item) => ({
+              id: item.cloudId || item.id,
+              name: item.name,
+              category: item.category,
+              assetKey: item.cloudCutoutAssetKey || item.cloudAssetKey
+            }))
+          }
+        });
+        setCloudJob(job);
+        const completed = await pollCloudGeneration(cloudConfig, cloudSession, job.jobId, setCloudJob);
+        if (completed.status !== "completed" || !completed.resultUrl) throw new Error(completed.error || "云端生成没有返回结果图。");
+        const imageResponse = await fetch(completed.resultUrl);
+        if (!imageResponse.ok) throw new Error("无法下载云端生成结果。");
+        result = {
+          imageBlob: await imageResponse.blob(),
+          notes: completed.notes || "云端 AI 生成结果",
+          debug: completed.debug || null
+        };
+      } else {
+        result = settings.endpoint
+          ? await callBackend(dbRef.current, settings, occasion, renderedPrompt, modelAssetId, selectedItems)
+          : await createLocalMockup(assetUrls[modelAssetId], selectedItems, assetUrls, occasion, settings);
+      }
 
       const resultBlob = result.imageBlob || (await dataUrlToBlob(result.imageUrl));
       const assetId = crypto.randomUUID();
@@ -705,7 +1235,7 @@ export default function Home() {
         itemIds: selectedItems.map((item) => item.id),
         itemNames: selectedItems.map((item) => item.name),
         favorite: false,
-        notes: result.notes || (settings.endpoint ? "AI 生成结果" : "本地预览稿"),
+        notes: result.notes || (cloudActive || settings.endpoint ? "AI 生成结果" : "本地预览稿"),
         debug: {
           ...requestDebug,
           response: result.debug || null
@@ -929,6 +1459,7 @@ export default function Home() {
             ["closet", "衣橱"],
             ["tryon", "试穿"],
             ["history", "历史"],
+            ["cloud", "云端"],
             ["settings", "设置"]
           ].map(([id, label]) => (
             <button className={`tab ${view === id ? "active" : ""}`} key={id} onClick={() => setView(id)} type="button">
@@ -943,7 +1474,7 @@ export default function Home() {
         <div className="status">
           <div className="status-row">
             <span>存储</span>
-            <strong>IndexedDB</strong>
+            <strong>{cloudActive ? "云端 + 本地缓存" : "IndexedDB"}</strong>
           </div>
           <div className="status-row">
             <span>生成</span>
@@ -1308,6 +1839,171 @@ export default function Home() {
               />
 
             </section>
+          </>
+        )}
+
+        {view === "cloud" && (
+          <>
+            <PageHead title="云端联调" desc="Cognito、S3、MongoDB 与异步生成">
+              {cloudSignedIn && <button className="button" disabled={Boolean(cloudBusy)} onClick={signOutCloud} type="button">退出</button>}
+              {cloudSignedIn && (
+                <button className="button" disabled={Boolean(cloudBusy)} onClick={cloudActive ? deactivateCloudPrimary : activateCloudPrimary} type="button">
+                  {cloudActive ? "本地优先" : cloudBusy === "sync" ? "同步中" : "同步并启用"}
+                </button>
+              )}
+              <button className="button primary" disabled={!cloudSignedIn || Boolean(cloudBusy)} onClick={refreshCloudState} type="button">
+                {cloudBusy === "state" ? "读取中" : "刷新状态"}
+              </button>
+            </PageHead>
+
+            <div className="cloud-layout">
+              <section className="panel cloud-panel cloud-config-panel">
+                <div className="cloud-panel-head">
+                  <div>
+                    <h3>连接配置</h3>
+                    <p>{cloudConfigured ? "已配置" : "待配置"}</p>
+                  </div>
+                  <button className="button" disabled={Boolean(cloudBusy)} onClick={saveCloudConfig} type="button">保存配置</button>
+                </div>
+                <div className="cloud-config-grid">
+                  <label>
+                    <span>API Gateway</span>
+                    <input className="input" onChange={(event) => setCloudConfig((current) => ({ ...current, apiBaseUrl: event.target.value }))} placeholder="https://.../dev" value={cloudConfig.apiBaseUrl} />
+                  </label>
+                  <label>
+                    <span>AWS Region</span>
+                    <input className="input" onChange={(event) => setCloudConfig((current) => ({ ...current, region: event.target.value }))} placeholder="ap-southeast-2" value={cloudConfig.region} />
+                  </label>
+                  <label>
+                    <span>User Pool ID</span>
+                    <input className="input" onChange={(event) => setCloudConfig((current) => ({ ...current, userPoolId: event.target.value }))} placeholder="ap-southeast-2_xxxxx" value={cloudConfig.userPoolId} />
+                  </label>
+                  <label>
+                    <span>App Client ID</span>
+                    <input className="input" onChange={(event) => setCloudConfig((current) => ({ ...current, clientId: event.target.value }))} placeholder="xxxxxxxx" value={cloudConfig.clientId} />
+                  </label>
+                </div>
+              </section>
+
+              <section className="panel cloud-panel cloud-auth-panel">
+                <div className="cloud-panel-head">
+                  <div>
+                    <h3>账号</h3>
+                    <p>{cloudSignedIn ? cloudSession.email || "已登录" : "未登录"}</p>
+                  </div>
+                  {cloudSignedIn && <span className="cloud-state good">已登录</span>}
+                </div>
+                {!cloudSignedIn && (
+                  <div className="cloud-auth-grid">
+                    <label>
+                      <span>邮箱</span>
+                      <input autoComplete="email" className="input" onChange={(event) => setCloudEmail(event.target.value)} type="email" value={cloudEmail} />
+                    </label>
+                    <label>
+                      <span>密码</span>
+                      <input autoComplete="current-password" className="input" onChange={(event) => setCloudPassword(event.target.value)} type="password" value={cloudPassword} />
+                    </label>
+                    <div className="cloud-action-row">
+                      <button className="button primary" disabled={!cloudConfigured || Boolean(cloudBusy)} onClick={signInCloud} type="button">
+                        {cloudBusy === "signin" ? "登录中" : "登录"}
+                      </button>
+                      <button className="button" disabled={!cloudConfigured || Boolean(cloudBusy)} onClick={signUpCloud} type="button">
+                        {cloudBusy === "signup" ? "注册中" : "注册"}
+                      </button>
+                    </div>
+                    {cloudConfirmationPending && (
+                      <div className="cloud-confirm-row">
+                        <input className="input" onChange={(event) => setCloudConfirmationCode(event.target.value)} placeholder="邮箱验证码" value={cloudConfirmationCode} />
+                        <button className="button" disabled={Boolean(cloudBusy)} onClick={confirmCloudSignUp} type="button">
+                          {cloudBusy === "confirm" ? "验证中" : "确认"}
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </section>
+
+              <section className="panel cloud-panel cloud-status-panel">
+                <div className="cloud-panel-head">
+                  <div>
+                    <h3>云端状态</h3>
+                    <p>{cloudActive ? "云端主存储" : cloudState ? "已读取" : "等待检查"}</p>
+                  </div>
+                  <span className={`cloud-state ${cloudActive || cloudState ? "good" : "neutral"}`}>{cloudActive ? "已启用" : cloudState ? "可访问" : "未检查"}</span>
+                </div>
+                <div className="cloud-counts">
+                  <span><strong>{cloudState?.items?.length || 0}</strong> 单品</span>
+                  <span><strong>{cloudState?.outfits?.length || 0}</strong> 搭配</span>
+                  <span><strong>{cloudState?.promptTemplates?.length || 0}</strong> 模板</span>
+                  <span><strong>{cloudState?.generations?.length || 0}</strong> 生成</span>
+                </div>
+                {cloudMessage && <div className={`cloud-message ${cloudMessage.tone}`}>{cloudMessage.text}</div>}
+                {cloudSyncProgress && (
+                  <div className="cloud-sync-progress">
+                    <span>{cloudSyncProgress.label}</span>
+                    <strong>{cloudSyncProgress.done}/{cloudSyncProgress.total}</strong>
+                  </div>
+                )}
+              </section>
+
+              <section className="panel cloud-panel cloud-assets-panel">
+                <div className="cloud-panel-head">
+                  <div>
+                    <h3>测试素材</h3>
+                    <p>S3 直传与短期下载预览</p>
+                  </div>
+                </div>
+                <div className="cloud-assets-grid">
+                  {[
+                    ["model", "人物参考图"],
+                    ["item", "单品图"]
+                  ].map(([slot, label]) => (
+                    <div className="cloud-asset" key={slot}>
+                      <div className="cloud-asset-preview">
+                        {cloudAssets[slot]?.previewUrl ? <img src={cloudAssets[slot].previewUrl} alt={label} /> : <span>{label}</span>}
+                      </div>
+                      <label className={`file-button ${!cloudSignedIn || Boolean(cloudBusy) ? "disabled" : ""}`}>
+                        <input accept="image/jpeg,image/png,image/webp" disabled={!cloudSignedIn || Boolean(cloudBusy)} onChange={(event) => uploadCloudAsset(slot, event)} type="file" />
+                        {cloudBusy === `upload-${slot}` ? "上传中" : "上传图片"}
+                      </label>
+                      {cloudAssets[slot]?.assetKey && <code>{cloudAssets[slot].assetKey.split("/").slice(-2).join("/")}</code>}
+                    </div>
+                  ))}
+                </div>
+                <div className="cloud-action-row cloud-test-actions">
+                  <button className="button" disabled={!cloudSignedIn || !cloudAssets.item || Boolean(cloudBusy)} onClick={createCloudTestItem} type="button">
+                    {cloudBusy === "item" ? "写入中" : "写入测试单品"}
+                  </button>
+                  <button className="button" disabled={!cloudSignedIn || !cloudAssets.item || Boolean(cloudBusy)} onClick={analyzeCloudItem} type="button">
+                    {cloudBusy === "analyze" ? "识别中" : "AI 识别"}
+                  </button>
+                  <button className="button danger" disabled={!cloudTestItem || Boolean(cloudBusy)} onClick={deleteCloudTestItem} type="button">
+                    {cloudBusy === "delete-item" ? "删除中" : "删除测试单品"}
+                  </button>
+                </div>
+                {cloudTestItem && <p className="cloud-record">MongoDB 测试记录：{cloudTestItem.id}</p>}
+                {cloudAnalysis && <pre className="cloud-json">{JSON.stringify(cloudAnalysis, null, 2)}</pre>}
+              </section>
+
+              <section className="panel cloud-panel cloud-generation-panel">
+                <div className="cloud-panel-head">
+                  <div>
+                    <h3>生成联调</h3>
+                    <p>API Lambda 排队，Worker 异步生成</p>
+                  </div>
+                  <button className="button primary" disabled={!cloudSignedIn || !cloudAssets.model || !cloudAssets.item || Boolean(cloudBusy)} onClick={generateCloudTest} type="button">
+                    {cloudBusy === "generate" ? "生成中" : "生成测试图"}
+                  </button>
+                </div>
+                <div className="cloud-job-row">
+                  <span>状态</span>
+                  <strong>{cloudJob?.status || "未创建任务"}</strong>
+                  {cloudJob?.jobId && <code>{cloudJob.jobId}</code>}
+                </div>
+                {cloudJob?.resultUrl && <img className="cloud-result-image" src={cloudJob.resultUrl} alt="云端生成测试结果" />}
+                {cloudJob?.error && <p className="cloud-job-error">{cloudJob.error}</p>}
+              </section>
+            </div>
           </>
         )}
       </main>
@@ -1863,6 +2559,126 @@ function buildRequestDebug(settings, occasion, userPrompt, finalPrompt, modelAss
 
 function normalizeSettings(savedSettings) {
   return { ...DEFAULT_SETTINGS, ...(savedSettings || {}) };
+}
+
+function normalizeCloudConfig(config) {
+  return {
+    apiBaseUrl: String(config?.apiBaseUrl || DEFAULT_CLOUD_CONFIG.apiBaseUrl).trim().replace(/\/+$/, ""),
+    region: String(config?.region || DEFAULT_CLOUD_CONFIG.region).trim(),
+    userPoolId: String(config?.userPoolId || DEFAULT_CLOUD_CONFIG.userPoolId).trim(),
+    clientId: String(config?.clientId || DEFAULT_CLOUD_CONFIG.clientId).trim()
+  };
+}
+
+function cloudItemPayload(item) {
+  return {
+    localId: item.id,
+    name: item.name,
+    category: item.category,
+    tags: Array.isArray(item.tags) ? item.tags : [],
+    quality: getItemQuality(item),
+    imageAssetKey: item.cloudAssetKey,
+    cutoutAssetKey: item.cloudCutoutAssetKey || null
+  };
+}
+
+function isCloudConfigComplete(config) {
+  const normalized = normalizeCloudConfig(config);
+  return Boolean(normalized.apiBaseUrl && normalized.region && normalized.userPoolId && normalized.clientId);
+}
+
+function requireCloudConfig(config) {
+  const normalized = normalizeCloudConfig(config);
+  if (!isCloudConfigComplete(normalized)) throw new Error("请先填写并保存云端连接配置。");
+  return normalized;
+}
+
+function isCloudSessionValid(session) {
+  return Boolean(session?.idToken && session?.expiresAt && Date.now() < Number(session.expiresAt) - 30_000);
+}
+
+function requireCloudSession(session) {
+  if (!isCloudSessionValid(session)) throw new Error("云端登录已过期，请重新登录。");
+  return session;
+}
+
+function createCloudSession(authenticationResult, email) {
+  const idToken = authenticationResult?.IdToken;
+  if (!idToken) throw new Error("Cognito 没有返回 ID token。");
+  const claims = decodeJwtPayload(idToken);
+  if (!claims?.sub || !claims?.exp) throw new Error("Cognito ID token 无效。");
+  return {
+    idToken,
+    email: claims.email || email,
+    userId: claims.sub,
+    expiresAt: Number(claims.exp) * 1000
+  };
+}
+
+function decodeJwtPayload(token) {
+  try {
+    const encoded = token.split(".")[1];
+    const padded = encoded.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(encoded.length / 4) * 4, "=");
+    return JSON.parse(atob(padded));
+  } catch {
+    return null;
+  }
+}
+
+async function cognitoRequest(config, action, payload) {
+  const response = await fetch(`https://cognito-idp.${config.region}.amazonaws.com/`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-amz-json-1.1",
+      "X-Amz-Target": `AWSCognitoIdentityProviderService.${action}`
+    },
+    body: JSON.stringify(payload)
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.message || data.Message || data.__type || `Cognito 请求失败 (${response.status})`);
+  return data;
+}
+
+async function cloudRequest(config, session, path, options = {}) {
+  const activeConfig = requireCloudConfig(config);
+  const activeSession = requireCloudSession(session);
+  const response = await fetch(`${activeConfig.apiBaseUrl}${path}`, {
+    method: options.method || "GET",
+    headers: {
+      Authorization: `Bearer ${activeSession.idToken}`,
+      ...(options.body ? { "Content-Type": "application/json" } : {}),
+      ...(options.headers || {})
+    },
+    body: options.body ? JSON.stringify(options.body) : undefined
+  });
+  const text = await response.text();
+  const data = text ? safeJsonParse(text) || { raw: text } : null;
+  if (!response.ok) throw new Error(data?.error || data?.message || `云端请求失败 (${response.status})`);
+  return data;
+}
+
+async function pollCloudGeneration(config, session, jobId, onUpdate) {
+  const deadline = Date.now() + 210_000;
+  let job = null;
+  while (Date.now() < deadline) {
+    await wait(2_000);
+    job = await cloudRequest(config, session, `/v1/generations/${encodeURIComponent(jobId)}`);
+    onUpdate(job);
+    if (job.status === "completed" || job.status === "failed") return job;
+  }
+  throw new Error("生成任务等待超时，请稍后刷新云端状态。");
+}
+
+function wait(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function safeJsonParse(value) {
+  try {
+    return value ? JSON.parse(value) : null;
+  } catch {
+    return null;
+  }
 }
 
 function defaultPromptTemplates() {
