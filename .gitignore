@@ -1,0 +1,32 @@
+# Dependencies and Next.js build output
+node_modules/
+.next/
+out/
+
+# Local environment files and API keys
+.env
+.env.local
+.env.*.local
+.env.development
+.env.production
+.env.test
+!.env.example
+
+# Deployment and TypeScript cache
+.vercel/
+*.tsbuildinfo
+next-env.d.ts
+
+# Logs and local runtime output
+*.log
+logs/
+dev-server*.log
+
+# Local data, backups, and editor/system files
+*.sqlite
+*.sqlite3
+*.db
+*.bak
+*.tmp
+.DS_Store
+Thumbs.db
